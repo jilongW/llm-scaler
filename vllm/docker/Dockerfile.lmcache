@@ -268,8 +268,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 #     then exec `vllm serve` with whatever args `docker run` supplied.
 #     LMCacheMPConnector connects during vLLM's KV-transfer init, so the server
 #     has to be listening first -- hence the healthcheck poll rather than a
-#     fixed sleep. Knobs come from the LMCACHE_MP_* env vars set above and can
-#     be overridden with `docker run -e`; ENABLE_LMCACHE=0 runs plain vLLM.
+#     fixed sleep. The server is only started when the `vllm serve` args
+#     actually ask for it, i.e. when `--kv-transfer-config` (or
+#     `--kv-transfer-config=...`) is present -- without that flag vLLM never
+#     connects to it, so running plain vLLM needs no extra env var. Knobs come
+#     from the LMCACHE_MP_* env vars set above and can be overridden with
+#     `docker run -e`; ENABLE_LMCACHE=0 force-skips it even when the flag is
+#     present.
 #     The L2 tier is a filesystem adapter under LMCACHE_MP_L2_PATH -- bind-mount
 #     a host dir there (`-v /some/dir:/lmcache_disk`) to keep it across runs,
 #     otherwise it lives in the container's writable layer.
@@ -280,7 +285,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 #     (no model arg, HF hub id with no local files, unparseable config) just
 #     warns and leaves the LMCACHE_MP_KVWEAVE_* defaults above in place. ---
 ENTRYPOINT ["bash", "-c", "\
-if [ \"${ENABLE_LMCACHE:-1}\" != \"0\" ]; then \
+lmcache_wanted=0; \
+for _arg in \"$@\"; do \
+  case \"$_arg\" in --kv-transfer-config|--kv-transfer-config=*) lmcache_wanted=1; break;; esac; \
+done; \
+if [ \"$lmcache_wanted\" = 1 ] && [ \"${ENABLE_LMCACHE:-1}\" != \"0\" ]; then \
   eval \"$(python3 -c '\
 import json,os,sys\n\
 a=sys.argv[1:];m=None\n\
@@ -323,6 +332,8 @@ sys.stderr.write(\"INFO: kvweave geometry from %s: num_kv_heads=%s head_dim=%s\\
   done; \
   [ \"$ready\" = 1 ] || { echo 'ERROR: LMCache server did not become healthy' >&2; exit 1; }; \
   echo \"=== LMCache MP server ready (pid=$lmcache_pid, metrics: http://localhost:${LMCACHE_MP_HTTP_PORT:-8090}/metrics) ===\"; \
+elif [ \"$lmcache_wanted\" != 1 ]; then \
+  echo '=== no --kv-transfer-config in args: skipping LMCache server ==='; \
 else \
   echo '=== ENABLE_LMCACHE=0: skipping LMCache server ==='; \
 fi; \

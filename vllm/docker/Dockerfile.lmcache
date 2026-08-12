@@ -102,27 +102,24 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     cp dist/*.whl ${WHEELS}/ && \
     rm -rf build dist
 
-# ---------------------------------------------------------------------------
-# 1c. vllm-xpu-kernels (patch + pinned commit)  ->  wheel
-# ---------------------------------------------------------------------------
-# RUN --mount=type=cache,target=/root/.cache/uv \
-#     set -eo pipefail && \
-#     source /opt/intel/oneapi/setvars.sh --force && \
-#     git clone https://github.com/vllm-project/vllm-xpu-kernels.git /src/vllm-xpu-kernels && \
-#     cd /src/vllm-xpu-kernels && \
-#     git checkout ${VLLM_XPU_KERNELS_COMMIT} && \
-#     git apply /tmp/vllm_xpu_kernels.patch && \
-#     sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# --extra-index-url=https://download.pytorch.org/whl/xpu|' requirements.txt && \
-#     sed -i '/^torch==/s/^/# /' requirements.txt && \
-#     sed -i 's|^triton-xpu|# triton-xpu|' requirements.txt && \
-#     sed -i 's|^transformers|# transformers|' requirements.txt && \
-#     uv pip install -r requirements.txt && \
-#     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
-#     pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
-#     rm -rf build .deps
-
-# temp WA vllm-xpu-kernels wheel build (vllm-xpu-kernels wheel is broken in v0.21.0)
-COPY ./patches/vllm_xpu_kernels-0.1.8.3.dev0+g3cab97a.d20260802-cp312-cp312-linux_x86_64.whl /wheels
+---------------------------------------------------------------------------
+1c. vllm-xpu-kernels (patch + pinned commit)  ->  wheel
+---------------------------------------------------------------------------
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eo pipefail && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    git clone https://github.com/vllm-project/vllm-xpu-kernels.git /src/vllm-xpu-kernels && \
+    cd /src/vllm-xpu-kernels && \
+    git checkout ${VLLM_XPU_KERNELS_COMMIT} && \
+    git apply /tmp/vllm_xpu_kernels.patch && \
+    sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# --extra-index-url=https://download.pytorch.org/whl/xpu|' requirements.txt && \
+    sed -i '/^torch==/s/^/# /' requirements.txt && \
+    sed -i 's|^triton-xpu|# triton-xpu|' requirements.txt && \
+    sed -i 's|^transformers|# transformers|' requirements.txt && \
+    uv pip install -r requirements.txt && \
+    export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
+    pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
+    rm -rf build .deps
 
 # 1d. kvweave
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -192,7 +189,7 @@ WORKDIR /llm-scaler/vllm
 #     workflows.  These are plain COPY (not bind-mounted): unlike the wheels
 #     below, they're meant to persist in the final image. ---
 COPY --from=builder /src/vllm ./vllm
-# COPY --from=builder /src/vllm-xpu-kernels ./vllm-xpu-kernels
+COPY --from=builder /src/vllm-xpu-kernels ./vllm-xpu-kernels
 COPY --from=builder /src/custom-esimd-kernels-vllm ./custom-esimd-kernels-vllm
 COPY --from=builder /src/kvq ./kvq
 COPY --from=builder /src/LMCache ./LMCache
@@ -275,9 +272,35 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 #     be overridden with `docker run -e`; ENABLE_LMCACHE=0 runs plain vLLM.
 #     The L2 tier is a filesystem adapter under LMCACHE_MP_L2_PATH -- bind-mount
 #     a host dir there (`-v /some/dir:/lmcache_disk`) to keep it across runs,
-#     otherwise it lives in the container's writable layer. ---
+#     otherwise it lives in the container's writable layer.
+#     The kvweave KV geometry is probed from the served model's own config.json:
+#     this image takes the model from the `vllm serve` args rather than an env
+#     var, so the helper scans "$@" for `--model <path>` / `--model=<path>` / a
+#     bare leading positional, then emits `export`s that get eval'd. Any failure
+#     (no model arg, HF hub id with no local files, unparseable config) just
+#     warns and leaves the LMCACHE_MP_KVWEAVE_* defaults above in place. ---
 ENTRYPOINT ["bash", "-c", "\
 if [ \"${ENABLE_LMCACHE:-1}\" != \"0\" ]; then \
+  eval \"$(python3 -c '\
+import json,os,sys\n\
+a=sys.argv[1:];m=None\n\
+for i,x in enumerate(a):\n\
+    if x==\"--model\" and i+1<len(a): m=a[i+1];break\n\
+    if x.startswith(\"--model=\"): m=x[8:];break\n\
+else:\n\
+    if a and not a[0].startswith(\"-\"): m=a[0]\n\
+p=m and (m+\"/config.json\" if os.path.isdir(m) else m)\n\
+if not p or not os.path.isfile(p): sys.exit(\"WARN: no local config.json for model %r; keeping kvweave defaults\"%m)\n\
+try: c=json.load(open(p))\n\
+except Exception as e: sys.exit(\"WARN: cannot parse %s: %s\"%(p,e))\n\
+for k in (\"text_config\",\"llm_config\",\"language_config\"):\n\
+    if isinstance(c.get(k),dict): c={**c,**c[k]};break\n\
+n=c.get(\"num_attention_heads\");kv=c.get(\"num_key_value_heads\",n);hd=c.get(\"head_dim\")\n\
+if hd is None and c.get(\"hidden_size\") and n: hd=c[\"hidden_size\"]//n\n\
+if kv: print(\"export LMCACHE_MP_KVWEAVE_NUM_KV_HEADS=%d\"%kv)\n\
+if hd: print(\"export LMCACHE_MP_KVWEAVE_HEAD_DIM=%d\"%hd)\n\
+sys.stderr.write(\"INFO: kvweave geometry from %s: num_kv_heads=%s head_dim=%s\\n\"%(p,kv,hd))\
+' \"$@\")\"; \
   echo '=== starting LMCache MP server ==='; \
   mkdir -p \"${LMCACHE_MP_L2_PATH:-/lmcache_disk}\"; \
   LMCACHE_LOG_LEVEL=\"${LMCACHE_LOG_LEVEL:-INFO}\" \

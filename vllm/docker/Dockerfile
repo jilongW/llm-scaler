@@ -99,9 +99,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     cp dist/*.whl ${WHEELS}/ && \
     rm -rf build dist
 
-# ---------------------------------------------------------------------------
-# 1c. vllm-xpu-kernels (patch + pinned commit)  ->  wheel
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+1c. vllm-xpu-kernels (patch + pinned commit)  ->  wheel
+---------------------------------------------------------------------------
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
     source /opt/intel/oneapi/setvars.sh --force && \
@@ -117,6 +117,32 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
     pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
     rm -rf build .deps
+
+# 1d. kvweave
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eo pipefail && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    git clone --filter=blob:none --no-checkout --depth 1 \
+    https://github.com/open-edge-platform/edge-ai-libraries.git /src/kvq && \
+    cd /src/kvq && \
+    git sparse-checkout set --cone libraries/kv-quant-offload && \
+    git checkout && \
+    cd libraries/kv-quant-offload && \
+    pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
+    rm -rf build
+
+# 1e. lmcache
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eo pipefail && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    git clone --branch v0.4.7 https://github.com/LMCache/LMCache.git  /src/LMCache && \
+    cd /src/LMCache && \
+    uv  pip install -r requirements/common.txt && \
+    git apply /src/kvq/libraries/kv-quant-offload/integration/lmcache/patches/lmcache-mp-hybrid.patch && \
+    git apply /src/kvq/libraries/kv-quant-offload/integration/lmcache/patches/lmcache-v0.4.7-mp-hybrid-to-kvweave.patch && \
+    BUILD_WITH_SYCL=1 pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
+    rm -rf build
+
 
 # Wheel inventory (visible in the build log for sanity).
 RUN ls -la ${WHEELS}/
@@ -139,7 +165,19 @@ ENV PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
     VLLM_QUANTIZE_Q40_LIB="/opt/venv/lib/python3.12/site-packages/vllm_int4_for_multi_arc.so" \
     VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 \
     VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
-    VLLM_WORKER_MULTIPROC_METHOD=spawn
+    VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    LMCACHE_MP_HOST=tcp://localhost \
+    LMCACHE_MP_PORT=6555 \
+    LMCACHE_MP_HTTP_PORT=8090 \
+    LMCACHE_MP_L1_SIZE_GB=5 \
+    LMCACHE_MP_EVICTION_POLICY=LRU \
+    LMCACHE_MP_EVICTION_TRIGGER_WATERMARK=0.7 \
+    LMCACHE_MP_EVICTION_RATIO=0.3 \
+    LMCACHE_MP_L1_KVWEAVE_QUANT=1 \
+    LMCACHE_MP_KVWEAVE_NUM_KV_HEADS=4 \
+    LMCACHE_MP_KVWEAVE_HEAD_DIM=256 \
+    LMCACHE_MP_KVWEAVE_NUM_THREADS=8 \
+    LMCACHE_MP_L2_PATH=/lmcache_disk
 
 WORKDIR /llm-scaler/vllm
 
@@ -150,6 +188,8 @@ WORKDIR /llm-scaler/vllm
 COPY --from=builder /src/vllm ./vllm
 COPY --from=builder /src/vllm-xpu-kernels ./vllm-xpu-kernels
 COPY --from=builder /src/custom-esimd-kernels-vllm ./custom-esimd-kernels-vllm
+COPY --from=builder /src/kvq ./kvq
+COPY --from=builder /src/LMCache ./LMCache
 
 # --- thin runtime OS deps, vLLM + kernel wheels, lean-core serving deps, and the
 #     triton-xpu fix/shrink all in ONE layer: cleanup must happen in the same RUN
@@ -196,10 +236,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest && \
     find /opt/intel/oneapi/ccl -mindepth 1 -maxdepth 1 -type d -not -name 2021.15 -exec rm -rf {} + && \
     rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" /tmp/oneccl-runtime && \
+    pip install -r /llm-scaler/vllm/LMCache/requirements/common.txt && \
     pip install /wheels/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-deps --force-reinstall \
         /wheels/custom_esimd_kernels_vllm-*.whl \
-        /wheels/vllm_xpu_kernels-*.whl && \
+        /wheels/vllm_xpu_kernels-*.whl \
+        /wheels/kvweave*.whl \
+        /wheels/lmcache*.whl && \
     pip install transformers==5.8.0 accelerate hf_transfer 'modelscope!=1.15.0' && \
     pip install librosa soundfile decord ijson && \
     pip install bigdl-core==2.4.0b2 && \
@@ -218,4 +261,78 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -f ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
     ln -s libMLIRDialectPlugin.so ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git
 
-ENTRYPOINT ["bash", "-c", "exec vllm serve \"$@\"", "--"]
+# --- entrypoint: start the LMCache MP server, wait for it to report healthy,
+#     then exec `vllm serve` with whatever args `docker run` supplied.
+#     LMCacheMPConnector connects during vLLM's KV-transfer init, so the server
+#     has to be listening first -- hence the healthcheck poll rather than a
+#     fixed sleep. The server is only started when the `vllm serve` args
+#     actually ask for it, i.e. when `--kv-transfer-config` (or
+#     `--kv-transfer-config=...`) is present -- without that flag vLLM never
+#     connects to it, so running plain vLLM needs no extra env var. Knobs come
+#     from the LMCACHE_MP_* env vars set above and can be overridden with
+#     `docker run -e`; ENABLE_LMCACHE=0 force-skips it even when the flag is
+#     present.
+#     The L2 tier is a filesystem adapter under LMCACHE_MP_L2_PATH -- bind-mount
+#     a host dir there (`-v /some/dir:/lmcache_disk`) to keep it across runs,
+#     otherwise it lives in the container's writable layer.
+#     The kvweave KV geometry is probed from the served model's own config.json:
+#     this image takes the model from the `vllm serve` args rather than an env
+#     var, so the helper scans "$@" for `--model <path>` / `--model=<path>` / a
+#     bare leading positional, then emits `export`s that get eval'd. Any failure
+#     (no model arg, HF hub id with no local files, unparseable config) just
+#     warns and leaves the LMCACHE_MP_KVWEAVE_* defaults above in place. ---
+ENTRYPOINT ["bash", "-c", "\
+lmcache_wanted=0; \
+for _arg in \"$@\"; do \
+  case \"$_arg\" in --kv-transfer-config|--kv-transfer-config=*) lmcache_wanted=1; break;; esac; \
+done; \
+if [ \"$lmcache_wanted\" = 1 ] && [ \"${ENABLE_LMCACHE:-1}\" != \"0\" ]; then \
+  eval \"$(python3 -c '\
+import json,os,sys\n\
+a=sys.argv[1:];m=None\n\
+for i,x in enumerate(a):\n\
+    if x==\"--model\" and i+1<len(a): m=a[i+1];break\n\
+    if x.startswith(\"--model=\"): m=x[8:];break\n\
+else:\n\
+    if a and not a[0].startswith(\"-\"): m=a[0]\n\
+p=m and (m+\"/config.json\" if os.path.isdir(m) else m)\n\
+if not p or not os.path.isfile(p): sys.exit(\"WARN: no local config.json for model %r; keeping kvweave defaults\"%m)\n\
+try: c=json.load(open(p))\n\
+except Exception as e: sys.exit(\"WARN: cannot parse %s: %s\"%(p,e))\n\
+for k in (\"text_config\",\"llm_config\",\"language_config\"):\n\
+    if isinstance(c.get(k),dict): c={**c,**c[k]};break\n\
+n=c.get(\"num_attention_heads\");kv=c.get(\"num_key_value_heads\",n);hd=c.get(\"head_dim\")\n\
+if hd is None and c.get(\"hidden_size\") and n: hd=c[\"hidden_size\"]//n\n\
+if kv: print(\"export LMCACHE_MP_KVWEAVE_NUM_KV_HEADS=%d\"%kv)\n\
+if hd: print(\"export LMCACHE_MP_KVWEAVE_HEAD_DIM=%d\"%hd)\n\
+sys.stderr.write(\"INFO: kvweave geometry from %s: num_kv_heads=%s head_dim=%s\\n\"%(p,kv,hd))\
+' \"$@\")\"; \
+  echo '=== starting LMCache MP server ==='; \
+  mkdir -p \"${LMCACHE_MP_L2_PATH:-/lmcache_disk}\"; \
+  LMCACHE_LOG_LEVEL=\"${LMCACHE_LOG_LEVEL:-INFO}\" \
+  lmcache server \
+    --port \"${LMCACHE_MP_PORT:-6555}\" \
+    --http-port \"${LMCACHE_MP_HTTP_PORT:-8090}\" \
+    --l1-size-gb \"${LMCACHE_MP_L1_SIZE_GB:-1}\" \
+    --eviction-policy \"${LMCACHE_MP_EVICTION_POLICY:-LRU}\" \
+    --eviction-trigger-watermark \"${LMCACHE_MP_EVICTION_TRIGGER_WATERMARK:-0.7}\" \
+    --eviction-ratio \"${LMCACHE_MP_EVICTION_RATIO:-0.3}\" \
+    --chunk-size 1024 \
+    --l2-adapter \"{\\\"type\\\": \\\"fs\\\", \\\"base_path\\\": \\\"${LMCACHE_MP_L2_PATH:-/lmcache_disk}\\\"}\" & \
+  lmcache_pid=$!; \
+  trap 'kill \"$lmcache_pid\" 2>/dev/null || true' EXIT INT TERM; \
+  ready=0; \
+  for _ in $(seq 1 \"${LMCACHE_STARTUP_TIMEOUT:-60}\"); do \
+    kill -0 \"$lmcache_pid\" 2>/dev/null || { echo 'ERROR: LMCache server exited during startup' >&2; exit 1; }; \
+    if python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:${LMCACHE_MP_HTTP_PORT:-8090}/healthcheck', timeout=1).read()\" >/dev/null 2>&1; then ready=1; break; fi; \
+    sleep 1; \
+  done; \
+  [ \"$ready\" = 1 ] || { echo 'ERROR: LMCache server did not become healthy' >&2; exit 1; }; \
+  echo \"=== LMCache MP server ready (pid=$lmcache_pid, metrics: http://localhost:${LMCACHE_MP_HTTP_PORT:-8090}/metrics) ===\"; \
+elif [ \"$lmcache_wanted\" != 1 ]; then \
+  echo '=== no --kv-transfer-config in args: skipping LMCache server ==='; \
+else \
+  echo '=== ENABLE_LMCACHE=0: skipping LMCache server ==='; \
+fi; \
+echo '=== starting vllm serve ==='; \
+exec vllm serve \"$@\"", "--"]

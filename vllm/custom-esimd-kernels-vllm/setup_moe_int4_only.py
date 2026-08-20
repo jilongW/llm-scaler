@@ -13,6 +13,7 @@ root = Path(__file__).parent.resolve()
 import torch
 
 torch_include = str(Path(torch.__file__).parent / "include")
+sycl_device_list = os.environ.get("TORCH_XPU_ARCH_LIST", "bmg")
 
 
 setup(
@@ -39,7 +40,7 @@ setup(
                     "-fsycl-device-code-split=per_kernel",
                     "-fsycl-targets=spir64_gen",
                     "-Xs",
-                    "-device bmg",
+                    f"-device {sycl_device_list}",
                     f"-I{torch_include}",
                 ],
             },

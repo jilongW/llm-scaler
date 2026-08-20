@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -9,6 +10,7 @@ root = Path(__file__).parent.resolve()
 
 import torch
 torch_include = str(Path(torch.__file__).parent / "include")
+sycl_device_list = os.environ.get("TORCH_XPU_ARCH_LIST", "bmg")
 
 ext_modules = [
     SyclExtension(
@@ -46,7 +48,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     "-fsycl-targets=spir64_gen", "-Xs", f"-device {sycl_device_list}",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -116,7 +118,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     "-fsycl-targets=spir64_gen", "-Xs", f"-device {sycl_device_list}",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -205,7 +207,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     "-fsycl-targets=spir64_gen", "-Xs", f"-device {sycl_device_list}",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -229,7 +231,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     "-fsycl-targets=spir64_gen", "-Xs", f"-device {sycl_device_list}",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],

@@ -1,3 +1,16 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7110bf4..33797e8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -34,7 +34,7 @@ install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)
+ set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12")
+ 
+ # Supported Intel GPU architectures.
+-set(SYCL_SUPPORTED_ARCHS "intel_gpu_pvc;intel_gpu_bmg_g21;intel_gpu_bmg_g31")
++set(SYCL_SUPPORTED_ARCHS "intel_gpu_pvc;intel_gpu_bmg_g21;intel_gpu_bmg_g31;intel_gpu_ptl_h;intel_gpu_ptl_u")
+ 
+ #
+ # Supported/expected torch versions for XPU.
 diff --git a/csrc/flash_attn/flash_api.cpp b/csrc/flash_attn/flash_api.cpp
 index 8d12b68..82bada4 100644
 --- a/csrc/flash_attn/flash_api.cpp
@@ -3057,7 +3070,7 @@ index 6ec4561..32436dd 100644
 +    const int* token_indx = nullptr);
 \ No newline at end of file
 diff --git a/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp b/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp
-index 1649412..8fd4728 100644
+index 1649412..1be9277 100644
 --- a/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp
 +++ b/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp
 @@ -20,7 +20,15 @@ torch::Tensor cutlass_grouped_gemm_interface(
@@ -3077,6 +3090,15 @@ index 1649412..8fd4728 100644
    if (vllm::xpu::force_xe_default_kernel()) {
  #ifdef VLLM_XPU_ENABLE_XE_DEFAULT
      int64_t groups = num_experts;
+@@ -32,7 +40,7 @@ torch::Tensor cutlass_grouped_gemm_interface(
+         "XE default cutlass kernel is not enabled in this build, force use XE "
+         "default kernel failed.");
+ #endif
+-  } else if (vllm::xpu::is_xe2_arch()) {
++  } else if (vllm::xpu::is_xe2_arch() || vllm::xpu::is_xe3_arch()) {
+ #ifdef VLLM_XPU_ENABLE_XE2
+     // Use XE2 cutlass kernel
+     return cutlass_grouped_gemm_xe2(
 @@ -46,7 +54,8 @@ torch::Tensor cutlass_grouped_gemm_interface(
          K,
          num_experts,

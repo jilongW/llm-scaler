@@ -89,16 +89,16 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     rm -rf build
 
 # ---------------------------------------------------------------------------
-# 1b. custom ESIMD kernels  ->  wheel  (TORCH_XPU_ARCH_LIST=bmg-g21)
+# 1b. custom ESIMD kernels  ->  wheel  (TORCH_XPU_ARCH_LIST=bmg-g21,ptl-h)
 # ---------------------------------------------------------------------------
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
     source /opt/intel/oneapi/setvars.sh --force && \
     cd /src/custom-esimd-kernels-vllm && \
-    TORCH_XPU_ARCH_LIST=bmg-g21 MAX_JOBS=1 python3 setup.py bdist_wheel && \
+    TORCH_XPU_ARCH_LIST=bmg-g21,ptl-h MAX_JOBS=1 python3 setup.py bdist_wheel && \
     cp dist/*.whl ${WHEELS}/ && \
     rm -rf build dist
-
+    
 # ---------------------------------------------------------------------------
 # 1c. vllm-xpu-kernels (patch + pinned commit)  ->  wheel
 # ---------------------------------------------------------------------------

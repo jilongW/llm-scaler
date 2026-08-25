@@ -46,7 +46,7 @@ ENV VIRTUAL_ENV=/opt/buildenv \
 # both bash-only (unavailable under the default /bin/sh).
 SHELL ["bash", "-c"]
 
-COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_xpu_kernels.patch ./patches/vllm_v0210_backports_after_multi_arc.patch /tmp/
+COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_xpu_kernels.patch /tmp/
 COPY ./custom-esimd-kernels-vllm /src/custom-esimd-kernels-vllm
 
 
@@ -84,7 +84,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git clone --depth 1 -b v0.21.0 https://github.com/vllm-project/vllm.git /src/vllm && \
     cd /src/vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
-    git apply /tmp/vllm_v0210_backports_after_multi_arc.patch && \
     uv pip install -r requirements/xpu.txt && \
     uv pip install grpcio-tools protobuf nanobind && \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
@@ -102,9 +101,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     cp dist/*.whl ${WHEELS}/ && \
     rm -rf build dist
 
----------------------------------------------------------------------------
-1c. vllm-xpu-kernels (patch + pinned commit)  ->  wheel
----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 1c. vllm-xpu-kernels (patch + pinned commit)  ->  wheel
+# ---------------------------------------------------------------------------
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
     source /opt/intel/oneapi/setvars.sh --force && \

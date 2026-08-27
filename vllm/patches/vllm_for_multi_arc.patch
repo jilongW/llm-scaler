@@ -21792,7 +21792,7 @@ index 4b8b86d86..5c038ede9 100755
 +                    # this path or decode attends beyond the window once
 +                    # seqlen>window -> progressive garbage on long context.
 +                    # Route them to flash_attn_varlen_func (passes window_size).
-+                    and self.sliding_window[0] == -1
++                    and sliding_window_size is None
 +                ):
 +                    try:
 +                        eagle_ops = importlib.import_module(

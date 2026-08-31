@@ -171,6 +171,7 @@ ENV PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
     LMCACHE_MP_HOST=tcp://localhost \
     LMCACHE_MP_PORT=6555 \
     LMCACHE_MP_HTTP_PORT=8090 \
+    LMCACHE_MP_L2_ENABLE=true \
     LMCACHE_MP_L1_SIZE_GB=5 \
     LMCACHE_MP_EVICTION_POLICY=LRU \
     LMCACHE_MP_EVICTION_TRIGGER_WATERMARK=0.7 \
@@ -179,6 +180,16 @@ ENV PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
     LMCACHE_MP_KVWEAVE_NUM_KV_HEADS=4 \
     LMCACHE_MP_KVWEAVE_HEAD_DIM=256 \
     LMCACHE_MP_KVWEAVE_NUM_THREADS=8 \
+    LMCACHE_MP_KVWEAVE_PRECOND=1 \
+    LMCACHE_MP_KVWEAVE_SCALING_METHOD=per_channel \
+    LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED=1 \
+    LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED=1 \
+    LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD=per_token \
+    LMCACHE_MP_KVWEAVE_CONV_RH=1 \
+    LMCACHE_MP_KVWEAVE_SSM_QUANT_ENABLED=1 \
+    LMCACHE_MP_KVWEAVE_SSM_SCALING_METHOD=per_token \
+    LMCACHE_MP_KVWEAVE_SSM_RH=1 \
+    LMCACHE_MP_KVWEAVE_LINEAR_ASYM=1 \
     LMCACHE_MP_L2_PATH=/lmcache_disk
 
 WORKDIR /llm-scaler/vllm
@@ -309,8 +320,31 @@ if kv: print(\"export LMCACHE_MP_KVWEAVE_NUM_KV_HEADS=%d\"%kv)\n\
 if hd: print(\"export LMCACHE_MP_KVWEAVE_HEAD_DIM=%d\"%hd)\n\
 sys.stderr.write(\"INFO: kvweave geometry from %s: num_kv_heads=%s head_dim=%s\\n\"%(p,kv,hd))\
 ' \"$@\")\"; \
+    if block_size_output=\"$(python3 /llm-scaler/vllm/kvq/libraries/kv-quant-offload/tests/calc_vllm_block_size.py \
+            \"${MODEL:-Qwen3.5-9B}\" \
+            --dtype \"${DTYPE:-float16}\" \
+            --tp-size \"${TP:-1}\" \
+            --block-size \"${VLLM_INITIAL_BLOCK_SIZE:-64}\" \
+            --ma-mode align \
+            --enable-prefix-caching)\"; then \
+        block_size=\"$(printf '%s\\n' \"${block_size_output}\" \
+                | awk -F': ' '/^vLLM block size[[:space:]]*:/ {print $2}' \
+                | awk '{print $1}')\"; \
+    else \
+        block_size=\"\"; \
+    fi; \
+    if [[ ! \"${block_size}\" =~ ^[0-9]+$ ]] || (( block_size <= 0 )); then \
+        echo \"WARNING: failed to obtain vLLM block size; using default 1024\" >&2; \
+        printf '%s\\n' \"${block_size_output:-}\" >&2; \
+        block_size=1024; \
+    fi; \
+    echo \"Using calculated vLLM block size: ${block_size} tokens\"; \
   echo '=== starting LMCache MP server ==='; \
-  mkdir -p \"${LMCACHE_MP_L2_PATH:-/lmcache_disk}\"; \
+    l2_args=(); \
+    if [[ \"${LMCACHE_MP_L2_ENABLE:-true}\" == \"true\" ]]; then \
+        mkdir -p \"${LMCACHE_MP_L2_PATH:-/lmcache_disk}\"; \
+        l2_args+=(--l2-adapter \"{\\\"type\\\": \\\"fs\\\", \\\"base_path\\\": \\\"${LMCACHE_MP_L2_PATH:-/lmcache_disk}\\\"}\"); \
+    fi; \
   LMCACHE_LOG_LEVEL=\"${LMCACHE_LOG_LEVEL:-INFO}\" \
   lmcache server \
     --port \"${LMCACHE_MP_PORT:-6555}\" \
@@ -319,8 +353,8 @@ sys.stderr.write(\"INFO: kvweave geometry from %s: num_kv_heads=%s head_dim=%s\\
     --eviction-policy \"${LMCACHE_MP_EVICTION_POLICY:-LRU}\" \
     --eviction-trigger-watermark \"${LMCACHE_MP_EVICTION_TRIGGER_WATERMARK:-0.7}\" \
     --eviction-ratio \"${LMCACHE_MP_EVICTION_RATIO:-0.3}\" \
-    --chunk-size 1024 \
-    --l2-adapter \"{\\\"type\\\": \\\"fs\\\", \\\"base_path\\\": \\\"${LMCACHE_MP_L2_PATH:-/lmcache_disk}\\\"}\" & \
+    --chunk-size \"${block_size}\" \
+    \"${l2_args[@]}\" & \
   lmcache_pid=$!; \
   trap 'kill \"$lmcache_pid\" 2>/dev/null || true' EXIT INT TERM; \
   ready=0; \
@@ -337,4 +371,7 @@ else \
   echo '=== ENABLE_LMCACHE=0: skipping LMCache server ==='; \
 fi; \
 echo '=== starting vllm serve ==='; \
+if [[ -n \"${block_size:-}\" ]]; then \
+    set -- --block-size \"${block_size}\" --max_num_batched_tokens=\"${block_size}\" \"$@\"; \
+fi; \
 exec vllm serve \"$@\"", "--"]
